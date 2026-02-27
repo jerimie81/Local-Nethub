@@ -12,6 +12,7 @@ Other devices connect via a browser — **no internet required**.
 - **Real-time messaging** — all connected devices chat via the browser
 - **Connected device tracker** — see who's on the network
 - **Foreground service** — keeps the server alive when the app is in the background
+- **Offline SSH tunnel relay** — host device can expose a local tunnel port (e.g. `:2222`) and forward traffic to any connected device SSH endpoint (`:22`)
 
 ---
 
@@ -28,6 +29,12 @@ Other devices connect via a browser — **no internet required**.
    - Start chatting — no internet, no accounts, no cloud
 
 ---
+
+## Offline SSH Tunnel (No Internet Required)
+
+- Open `http://<HOST_IP>:8080` and use the **Offline SSH Tunnel** section.
+- Set **Target host/IP** to the SSH destination device, keep target port `22`, and set a listening port (default `2222`).
+- Start the tunnel, then from any connected device run: `ssh -p 2222 <user>@<HOST_IP>`.
 
 ## Build Instructions
 
