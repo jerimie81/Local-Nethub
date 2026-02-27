@@ -12,6 +12,8 @@ Other devices connect via a browser — **no internet required**.
 - **Real-time messaging** — all connected devices chat via the browser
 - **Connected device tracker** — see who's on the network
 - **Foreground service** — keeps the server alive when the app is in the background
+- **Offline SSH tunnel relay** — host device can expose a local tunnel port (e.g. `:2222`) and forward traffic to any connected device SSH endpoint (`:22`)
+- **Phase 1 QR SSH key pairing** — challenge-response payloads with SAS verification for offline device-to-device pairing
 
 ---
 
@@ -28,6 +30,22 @@ Other devices connect via a browser — **no internet required**.
    - Start chatting — no internet, no accounts, no cloud
 
 ---
+
+## Offline SSH Tunnel (No Internet Required)
+
+- Open `http://<HOST_IP>:8080` and use the **Offline SSH Tunnel** section.
+- Set **Target host/IP** to the SSH destination device, keep target port `22`, and set a listening port (default `2222`).
+- Start the tunnel, then from any connected device run: `ssh -p 2222 <user>@<HOST_IP>`.
+
+## Phase 1 QR SSH Key Pairing
+
+- In the **Phase 1: QR SSH Key Pairing** section, enter your device name + SSH public key and create an **Init payload**.
+- Encode that payload as a QR code on device A, scan it on device B, then generate a **Response payload** on B.
+- Scan the response back on device A and run **Finalize**, then verify the same SAS appears on both devices.
+- Endpoints added for this flow:
+  - `POST /api/pairing/qr/init`
+  - `POST /api/pairing/qr/respond`
+  - `POST /api/pairing/qr/finalize`
 
 ## Build Instructions
 

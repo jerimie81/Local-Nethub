@@ -28,28 +28,39 @@ class LocalHttpServer(private val port: Int = 8080) {
     private val TAG = "LocalHttpServer"
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     val messages = CopyOnWriteArrayList<ChatMessage>()
     val connectedClients = CopyOnWriteArrayList<ConnectedClient>()
     var onUpdate: (() -> Unit)? = null
+    private val tunnelManager = SshTunnelManager()
+    private val keyPairingManager = SshKeyPairingManager()
+    private val qrPairingManager = QrKeyPairingManager(keyPairingManager)
 
     var isRunning = false
         private set
 
     fun start() {
         if (isRunning) return
+        if (!scope.isActive) {
+            scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        }
         isRunning = true
         serverJob = scope.launch {
             try {
                 serverSocket = ServerSocket(port)
                 Log.i(TAG, "Server started on port $port")
-                while (isActive && !serverSocket!!.isClosed) {
-                    val socket = serverSocket!!.accept()
+                while (isActive) {
+                    val currentServerSocket = serverSocket ?: break
+                    if (currentServerSocket.isClosed) break
+                    val socket = currentServerSocket.accept()
                     launch { handleClient(socket) }
                 }
+            } catch (_: java.net.SocketException) {
+                // Expected when stopping the server and closing ServerSocket.
             } catch (e: Exception) {
                 Log.e(TAG, "Server error: ${e.message}")
+            } finally {
                 isRunning = false
             }
         }
@@ -58,8 +69,10 @@ class LocalHttpServer(private val port: Int = 8080) {
     fun stop() {
         isRunning = false
         serverJob?.cancel()
+        serverJob = null
         serverSocket?.close()
-        scope.cancel()
+        serverSocket = null
+        tunnelManager.stopAll()
         Log.i(TAG, "Server stopped")
     }
 
@@ -96,7 +109,12 @@ class LocalHttpServer(private val port: Int = 8080) {
                 val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
                 if (contentLength > 0) {
                     val chars = CharArray(contentLength)
-                    reader.read(chars, 0, contentLength)
+                    var read = 0
+                    while (read < contentLength) {
+                        val bytesRead = reader.read(chars, read, contentLength - read)
+                        if (bytesRead <= 0) break
+                        read += bytesRead
+                    }
                     body = String(chars)
                 }
             }
@@ -132,6 +150,114 @@ class LocalHttpServer(private val port: Int = 8080) {
                     sendResponse(writer, 200, "application/json",
                         """{"status":"online","clients":${connectedClients.size},"messages":${messages.size}}""")
                 }
+                path == "/api/tunnels" && method == "GET" -> {
+                    sendResponse(writer, 200, "application/json", tunnelsToJson())
+                }
+                path == "/api/tunnel/start" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val targetHost = params["targetHost"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val listenPort = params["listenPort"]?.toIntOrNull() ?: 2222
+                    val targetPort = params["targetPort"]?.toIntOrNull() ?: 22
+                    val result = tunnelManager.startTunnel(listenPort = listenPort, targetHost = targetHost, targetPort = targetPort)
+                    if (result.isSuccess) {
+                        onUpdate?.invoke()
+                        sendResponse(writer, 200, "application/json", """{"status":"ok","message":"Tunnel started"}""")
+                    } else {
+                        sendResponse(writer, 400, "application/json", """{"status":"error","message":"${escapeJson(result.exceptionOrNull()?.message ?: "Unknown error")}"}""")
+                    }
+                }
+                path == "/api/tunnel/stop" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val listenPort = params["listenPort"]?.toIntOrNull()
+                    if (listenPort != null && tunnelManager.stopTunnel(listenPort)) {
+                        onUpdate?.invoke()
+                        sendResponse(writer, 200, "application/json", """{"status":"ok","message":"Tunnel stopped"}""")
+                    } else {
+                        sendResponse(writer, 404, "application/json", """{"status":"error","message":"Tunnel not found"}""")
+                    }
+                }
+                path == "/api/keys" && method == "GET" -> {
+                    sendResponse(writer, 200, "application/json", pairedKeysToJson())
+                }
+                path == "/api/keys/pair" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val deviceName = params["deviceName"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val publicKey = params["publicKey"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val result = keyPairingManager.pairKey(deviceName = deviceName, publicKey = publicKey)
+                    if (result.isSuccess) {
+                        onUpdate?.invoke()
+                        val paired = result.getOrThrow()
+                        sendResponse(writer, 200, "application/json", """{"status":"ok","id":"${escapeJson(paired.id)}","fingerprint":"${escapeJson(paired.fingerprint)}"}""")
+                    } else {
+                        sendResponse(writer, 400, "application/json", """{"status":"error","message":"${escapeJson(result.exceptionOrNull()?.message ?: "Pairing failed")}"}""")
+                    }
+                }
+                path == "/api/keys/unpair" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val id = params["id"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    if (id.isNotBlank() && keyPairingManager.unpairKey(id)) {
+                        onUpdate?.invoke()
+                        sendResponse(writer, 200, "application/json", """{"status":"ok"}""")
+                    } else {
+                        sendResponse(writer, 404, "application/json", """{"status":"error","message":"Key not found"}""")
+                    }
+                }
+                path == "/api/pairing/qr/init" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val deviceName = params["deviceName"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val publicKey = params["publicKey"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val result = qrPairingManager.createInitPayload(deviceName = deviceName, publicKey = publicKey)
+                    if (result.isSuccess) {
+                        val init = result.getOrThrow()
+                        sendResponse(
+                            writer,
+                            200,
+                            "application/json",
+                            """{"status":"ok","sessionId":"${escapeJson(init.sessionId)}","sas":"${escapeJson(init.sas)}","expiresAt":${init.expiresAt},"payload":"${escapeJson(init.payload)}"}"""
+                        )
+                    } else {
+                        sendResponse(writer, 400, "application/json", """{"status":"error","message":"${escapeJson(result.exceptionOrNull()?.message ?: "Init failed")}"}""")
+                    }
+                }
+                path == "/api/pairing/qr/respond" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val initPayload = params["initPayload"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val deviceName = params["deviceName"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val publicKey = params["publicKey"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val result = qrPairingManager.createResponsePayload(
+                        initPayload = initPayload,
+                        deviceName = deviceName,
+                        publicKey = publicKey
+                    )
+                    if (result.isSuccess) {
+                        val response = result.getOrThrow()
+                        sendResponse(
+                            writer,
+                            200,
+                            "application/json",
+                            """{"status":"ok","sessionId":"${escapeJson(response.sessionId)}","sas":"${escapeJson(response.sas)}","expiresAt":${response.expiresAt},"fingerprint":"${escapeJson(response.responderFingerprint)}","payload":"${escapeJson(response.payload)}"}"""
+                        )
+                    } else {
+                        sendResponse(writer, 400, "application/json", """{"status":"error","message":"${escapeJson(result.exceptionOrNull()?.message ?: "Response failed")}"}""")
+                    }
+                }
+                path == "/api/pairing/qr/finalize" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val responsePayload = params["responsePayload"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val result = qrPairingManager.finalizeFromResponse(responsePayload)
+                    if (result.isSuccess) {
+                        onUpdate?.invoke()
+                        val finalized = result.getOrThrow()
+                        sendResponse(
+                            writer,
+                            200,
+                            "application/json",
+                            """{"status":"ok","sessionId":"${escapeJson(finalized.sessionId)}","sas":"${escapeJson(finalized.sas)}","id":"${escapeJson(finalized.pairedKey.id)}","fingerprint":"${escapeJson(finalized.pairedKey.fingerprint)}"}"""
+                        )
+                    } else {
+                        sendResponse(writer, 400, "application/json", """{"status":"error","message":"${escapeJson(result.exceptionOrNull()?.message ?: "Finalize failed")}"}""")
+                    }
+                }
                 path == "/style.css" -> {
                     sendResponse(writer, 200, "text/css", buildCss())
                 }
@@ -148,7 +274,7 @@ class LocalHttpServer(private val port: Int = 8080) {
     }
 
     private fun sendResponse(writer: PrintWriter, code: Int, contentType: String, body: String) {
-        val status = when (code) { 200 -> "OK"; 404 -> "Not Found"; else -> "OK" }
+        val status = when (code) { 200 -> "OK"; 400 -> "Bad Request"; 404 -> "Not Found"; else -> "OK" }
         val bytes = body.toByteArray(Charsets.UTF_8)
         writer.print("HTTP/1.1 $code $status\r\n")
         writer.print("Content-Type: $contentType; charset=UTF-8\r\n")
@@ -163,7 +289,7 @@ class LocalHttpServer(private val port: Int = 8080) {
     private fun parseForm(body: String): Map<String, String> {
         val map = mutableMapOf<String, String>()
         body.split("&").forEach { pair ->
-            val kv = pair.split("=")
+            val kv = pair.split("=", limit = 2)
             if (kv.size == 2) map[kv[0]] = kv[1]
         }
         return map
@@ -184,6 +310,32 @@ class LocalHttpServer(private val port: Int = 8080) {
         connectedClients.forEachIndexed { i, c ->
             if (i > 0) sb.append(",")
             sb.append("""{"ip":"${c.ip}","since":"${formatTime(c.connectedAt)}"}""")
+        }
+        sb.append("]")
+        return sb.toString()
+    }
+
+    private fun tunnelsToJson(): String {
+        val tunnels = tunnelManager.listTunnels()
+        val sb = StringBuilder("[")
+        tunnels.forEachIndexed { i, t ->
+            if (i > 0) sb.append(",")
+            sb.append(
+                """{"listenPort":${t.config.listenPort},"targetHost":"${escapeJson(t.config.targetHost)}","targetPort":${t.config.targetPort},"activeConnections":${t.activeConnections},"lastError":"${escapeJson(t.lastError)}"}"""
+            )
+        }
+        sb.append("]")
+        return sb.toString()
+    }
+
+    private fun pairedKeysToJson(): String {
+        val keys = keyPairingManager.listKeys()
+        val sb = StringBuilder("[")
+        keys.forEachIndexed { i, k ->
+            if (i > 0) sb.append(",")
+            sb.append(
+                """{"id":"${escapeJson(k.id)}","deviceName":"${escapeJson(k.deviceName)}","fingerprint":"${escapeJson(k.fingerprint)}","pairedAt":${k.pairedAt}}"""
+            )
         }
         sb.append("]")
         return sb.toString()
@@ -258,6 +410,31 @@ class LocalHttpServer(private val port: Int = 8080) {
     <div id="clients"></div>
   </div>
 </div>
+<div style="padding:12px 16px;border-top:1px solid #2a3040;background:#111522">
+  <h3 style="font-size:0.85rem;color:#90caf9;margin-bottom:8px">Offline SSH Tunnel</h3>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <input id="targetHost" placeholder="Target host/IP" style="background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0" />
+    <input id="targetPort" type="number" value="22" style="width:90px;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0" />
+    <input id="listenPort" type="number" value="2222" style="width:90px;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0" />
+    <button onclick="startTunnel()" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:8px 12px">Start Tunnel</button>
+    <button onclick="stopTunnel()" style="background:#b71c1c;color:#fff;border:none;border-radius:6px;padding:8px 12px">Stop Tunnel</button>
+  </div>
+  <div id="tunnelStatus" style="margin-top:8px;font-size:0.8rem;color:#a5d6a7"></div>
+</div>
+<div style="padding:12px 16px;border-top:1px solid #2a3040;background:#0d1320">
+  <h3 style="font-size:0.85rem;color:#ffcc80;margin-bottom:8px">Phase 1: QR SSH Key Pairing</h3>
+  <div style="font-size:0.78rem;color:#b0bec5;margin-bottom:8px">Step 1 on device A: Generate init payload and show as QR. Step 2 on device B: scan and respond. Step 3 on A: scan response and finalize. Verify SAS on both devices.</div>
+  <input id="pairDeviceName" placeholder="This device name" style="width:100%;margin-bottom:8px;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0" />
+  <textarea id="pairPublicKey" rows="3" placeholder="This device SSH public key (ssh-ed25519 ...)
+" style="width:100%;margin-bottom:8px;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0"></textarea>
+  <button onclick="createQrInit()" style="background:#ef6c00;color:#fff;border:none;border-radius:6px;padding:8px 12px">Create Init Payload</button>
+  <div id="pairStatus" style="margin-top:8px;font-size:0.8rem;color:#ffe0b2"></div>
+  <textarea id="initPayload" rows="3" placeholder="Init payload (encode this as QR for device B)" style="width:100%;margin-top:8px;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0"></textarea>
+  <button onclick="createQrResponse()" style="margin-top:8px;background:#00897b;color:#fff;border:none;border-radius:6px;padding:8px 12px">Create Response From Init</button>
+  <textarea id="responsePayload" rows="3" placeholder="Response payload (encode this as QR back to device A)" style="width:100%;margin-top:8px;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0"></textarea>
+  <button onclick="finalizeQrPairing()" style="margin-top:8px;background:#5e35b1;color:#fff;border:none;border-radius:6px;padding:8px 12px">Finalize From Response</button>
+  <div id="pairedKeys" style="margin-top:8px;font-size:0.8rem;color:#ffe0b2"></div>
+</div>
 <script>
 let lastMsgCount = 0;
 const myIp = location.hostname;
@@ -315,10 +492,159 @@ function esc(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+async function loadTunnels() {
+  try {
+    const r = await fetch('/api/tunnels');
+    const tunnels = await r.json();
+    if (!tunnels.length) {
+      document.getElementById('tunnelStatus').textContent = 'No active tunnel';
+      return;
+    }
+    const t = tunnels[0];
+    document.getElementById('tunnelStatus').textContent =
+      'Listening :' + t.listenPort + ' -> ' + t.targetHost + ':' + t.targetPort +
+      ' | active connections: ' + t.activeConnections + (t.lastError ? (' | last error: ' + t.lastError) : '');
+  } catch (e) {}
+}
+
+async function startTunnel() {
+  const targetHost = document.getElementById('targetHost').value.trim();
+  const targetPort = document.getElementById('targetPort').value.trim() || '22';
+  const listenPort = document.getElementById('listenPort').value.trim() || '2222';
+  if (!targetHost) return;
+  try {
+    await fetch('/api/tunnel/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'targetHost=' + encodeURIComponent(targetHost) + '&targetPort=' + encodeURIComponent(targetPort) + '&listenPort=' + encodeURIComponent(listenPort)
+    });
+    loadTunnels();
+  } catch (e) {}
+}
+
+async function stopTunnel() {
+  const listenPort = document.getElementById('listenPort').value.trim() || '2222';
+  try {
+    await fetch('/api/tunnel/stop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'listenPort=' + encodeURIComponent(listenPort)
+    });
+    loadTunnels();
+  } catch (e) {}
+}
+
+async function loadPairedKeys() {
+  try {
+    const r = await fetch('/api/keys');
+    const keys = await r.json();
+    const el = document.getElementById('pairedKeys');
+    if (!keys.length) {
+      el.textContent = 'No paired keys yet.';
+      return;
+    }
+    el.innerHTML = keys.map(k =>
+      '<div style="margin-top:6px;padding:6px;border:1px solid #2a3040;border-radius:6px">' +
+      '<b>' + esc(k.deviceName) + '</b><br/>' +
+      '<code>' + esc(k.fingerprint) + '</code> ' +
+      '<button onclick="unpairKey(\'' + k.id + '\')" style="margin-left:8px;background:#6d4c41;color:#fff;border:none;border-radius:4px;padding:2px 6px">Remove</button>' +
+      '</div>'
+    ).join('');
+  } catch (e) {}
+}
+
+async function createQrInit() {
+  const deviceName = document.getElementById('pairDeviceName').value.trim() || 'Device A';
+  const publicKey = document.getElementById('pairPublicKey').value.trim();
+  const status = document.getElementById('pairStatus');
+  if (!publicKey) {
+    status.textContent = 'Public key is required.';
+    return;
+  }
+  try {
+    const r = await fetch('/api/pairing/qr/init', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'deviceName=' + encodeURIComponent(deviceName) + '&publicKey=' + encodeURIComponent(publicKey)
+    });
+    const data = await r.json();
+    if (data.status === 'ok') {
+      document.getElementById('initPayload').value = data.payload;
+      status.textContent = 'Init created. Verify SAS on both devices: ' + data.sas;
+    } else {
+      status.textContent = data.message || 'Init failed';
+    }
+  } catch (e) {}
+}
+
+async function createQrResponse() {
+  const initPayload = document.getElementById('initPayload').value.trim();
+  const deviceName = document.getElementById('pairDeviceName').value.trim() || 'Device B';
+  const publicKey = document.getElementById('pairPublicKey').value.trim();
+  const status = document.getElementById('pairStatus');
+  if (!initPayload || !publicKey) {
+    status.textContent = 'Init payload and public key are required.';
+    return;
+  }
+  try {
+    const r = await fetch('/api/pairing/qr/respond', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'initPayload=' + encodeURIComponent(initPayload) + '&deviceName=' + encodeURIComponent(deviceName) + '&publicKey=' + encodeURIComponent(publicKey)
+    });
+    const data = await r.json();
+    if (data.status === 'ok') {
+      document.getElementById('responsePayload').value = data.payload;
+      status.textContent = 'Response created. Verify SAS: ' + data.sas;
+    } else {
+      status.textContent = data.message || 'Response failed';
+    }
+  } catch (e) {}
+}
+
+async function finalizeQrPairing() {
+  const responsePayload = document.getElementById('responsePayload').value.trim();
+  const status = document.getElementById('pairStatus');
+  if (!responsePayload) {
+    status.textContent = 'Response payload is required.';
+    return;
+  }
+  try {
+    const r = await fetch('/api/pairing/qr/finalize', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'responsePayload=' + encodeURIComponent(responsePayload)
+    });
+    const data = await r.json();
+    if (data.status === 'ok') {
+      status.textContent = 'Pairing complete. Fingerprint: ' + data.fingerprint + '. SAS verified: ' + data.sas;
+      document.getElementById('responsePayload').value = '';
+      loadPairedKeys();
+    } else {
+      status.textContent = data.message || 'Finalize failed';
+    }
+  } catch (e) {}
+}
+
+async function unpairKey(id) {
+  try {
+    await fetch('/api/keys/unpair', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'id=' + encodeURIComponent(id)
+    });
+    loadPairedKeys();
+  } catch (e) {}
+}
+
 setInterval(loadMessages, 1500);
 setInterval(loadClients, 3000);
+setInterval(loadTunnels, 3000);
+setInterval(loadPairedKeys, 5000);
 loadMessages();
 loadClients();
+loadTunnels();
+loadPairedKeys();
 </script>
 </body>
 </html>
