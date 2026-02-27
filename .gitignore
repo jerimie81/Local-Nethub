@@ -1,0 +1,22 @@
+# Android Studio
+.gradle/
+/build/
+/captures/
+.DS_Store
+/local.properties
+/.idea/
+*.iml
+*.hprof
+*.keystore
+*~
+# Misc
+*.apk
+*.ap_
+*.aab
+*.aar
+*.zip
+/out/
+/release/
+/debug/
+# C/C++
+.cxx/
