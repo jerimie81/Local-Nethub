@@ -28,7 +28,7 @@ class LocalHttpServer(private val port: Int = 8080) {
     private val TAG = "LocalHttpServer"
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     val messages = CopyOnWriteArrayList<ChatMessage>()
     val connectedClients = CopyOnWriteArrayList<ConnectedClient>()
@@ -39,17 +39,25 @@ class LocalHttpServer(private val port: Int = 8080) {
 
     fun start() {
         if (isRunning) return
+        if (!scope.isActive) {
+            scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        }
         isRunning = true
         serverJob = scope.launch {
             try {
                 serverSocket = ServerSocket(port)
                 Log.i(TAG, "Server started on port $port")
-                while (isActive && !serverSocket!!.isClosed) {
-                    val socket = serverSocket!!.accept()
+                while (isActive) {
+                    val currentServerSocket = serverSocket ?: break
+                    if (currentServerSocket.isClosed) break
+                    val socket = currentServerSocket.accept()
                     launch { handleClient(socket) }
                 }
+            } catch (_: java.net.SocketException) {
+                // Expected when stopping the server and closing ServerSocket.
             } catch (e: Exception) {
                 Log.e(TAG, "Server error: ${e.message}")
+            } finally {
                 isRunning = false
             }
         }
@@ -58,8 +66,9 @@ class LocalHttpServer(private val port: Int = 8080) {
     fun stop() {
         isRunning = false
         serverJob?.cancel()
+        serverJob = null
         serverSocket?.close()
-        scope.cancel()
+        serverSocket = null
         Log.i(TAG, "Server stopped")
     }
 
@@ -96,7 +105,12 @@ class LocalHttpServer(private val port: Int = 8080) {
                 val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
                 if (contentLength > 0) {
                     val chars = CharArray(contentLength)
-                    reader.read(chars, 0, contentLength)
+                    var read = 0
+                    while (read < contentLength) {
+                        val bytesRead = reader.read(chars, read, contentLength - read)
+                        if (bytesRead <= 0) break
+                        read += bytesRead
+                    }
                     body = String(chars)
                 }
             }
@@ -163,7 +177,7 @@ class LocalHttpServer(private val port: Int = 8080) {
     private fun parseForm(body: String): Map<String, String> {
         val map = mutableMapOf<String, String>()
         body.split("&").forEach { pair ->
-            val kv = pair.split("=")
+            val kv = pair.split("=", limit = 2)
             if (kv.size == 2) map[kv[0]] = kv[1]
         }
         return map
