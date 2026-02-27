@@ -90,7 +90,6 @@ class LocalHttpServer(private val port: Int = 8080) {
             val method = parts[0]
             val rawPath = parts[1]
             val path = rawPath.substringBefore("?")
-            val queryString = if (rawPath.contains("?")) rawPath.substringAfter("?") else ""
 
             // Read headers
             val headers = mutableMapOf<String, String>()
@@ -115,7 +114,7 @@ class LocalHttpServer(private val port: Int = 8080) {
                         if (bytesRead <= 0) break
                         read += bytesRead
                     }
-                    body = String(chars)
+                    body = String(chars, 0, read)
                 }
             }
 

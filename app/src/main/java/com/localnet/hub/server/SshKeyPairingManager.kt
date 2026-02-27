@@ -1,6 +1,7 @@
 package com.localnet.hub.server
 
 import java.security.MessageDigest
+import java.util.Base64
 import java.util.concurrent.CopyOnWriteArrayList
 
 data class PairedSshKey(
@@ -66,7 +67,7 @@ class SshKeyPairingManager {
 
     private fun fingerprint(publicKey: String): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(publicKey.toByteArray())
-        val b64 = android.util.Base64.encodeToString(digest, android.util.Base64.NO_WRAP)
+        val b64 = Base64.getEncoder().withoutPadding().encodeToString(digest)
         return "SHA256:$b64"
     }
 }

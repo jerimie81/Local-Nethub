@@ -35,7 +35,6 @@ class QrKeyPairingManager(
     private data class PendingSession(
         val sessionId: String,
         val nonce: String,
-        val initiatorFingerprint: String,
         val sas: String,
         val expiresAt: Long
     )
@@ -55,7 +54,6 @@ class QrKeyPairingManager(
         sessions[sessionId] = PendingSession(
             sessionId = sessionId,
             nonce = nonce,
-            initiatorFingerprint = pairResult.fingerprint,
             sas = sas,
             expiresAt = expiresAt
         )
