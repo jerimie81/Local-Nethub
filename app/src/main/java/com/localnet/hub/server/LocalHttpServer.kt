@@ -33,6 +33,8 @@ class LocalHttpServer(private val port: Int = 8080) {
     val messages = CopyOnWriteArrayList<ChatMessage>()
     val connectedClients = CopyOnWriteArrayList<ConnectedClient>()
     var onUpdate: (() -> Unit)? = null
+    private val tunnelManager = SshTunnelManager()
+    private val keyPairingManager = SshKeyPairingManager()
 
     var isRunning = false
         private set
@@ -69,6 +71,7 @@ class LocalHttpServer(private val port: Int = 8080) {
         serverJob = null
         serverSocket?.close()
         serverSocket = null
+        tunnelManager.stopAll()
         Log.i(TAG, "Server stopped")
     }
 
@@ -146,6 +149,58 @@ class LocalHttpServer(private val port: Int = 8080) {
                     sendResponse(writer, 200, "application/json",
                         """{"status":"online","clients":${connectedClients.size},"messages":${messages.size}}""")
                 }
+                path == "/api/tunnels" && method == "GET" -> {
+                    sendResponse(writer, 200, "application/json", tunnelsToJson())
+                }
+                path == "/api/tunnel/start" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val targetHost = params["targetHost"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val listenPort = params["listenPort"]?.toIntOrNull() ?: 2222
+                    val targetPort = params["targetPort"]?.toIntOrNull() ?: 22
+                    val result = tunnelManager.startTunnel(listenPort = listenPort, targetHost = targetHost, targetPort = targetPort)
+                    if (result.isSuccess) {
+                        onUpdate?.invoke()
+                        sendResponse(writer, 200, "application/json", """{"status":"ok","message":"Tunnel started"}""")
+                    } else {
+                        sendResponse(writer, 400, "application/json", """{"status":"error","message":"${escapeJson(result.exceptionOrNull()?.message ?: "Unknown error")}"}""")
+                    }
+                }
+                path == "/api/tunnel/stop" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val listenPort = params["listenPort"]?.toIntOrNull()
+                    if (listenPort != null && tunnelManager.stopTunnel(listenPort)) {
+                        onUpdate?.invoke()
+                        sendResponse(writer, 200, "application/json", """{"status":"ok","message":"Tunnel stopped"}""")
+                    } else {
+                        sendResponse(writer, 404, "application/json", """{"status":"error","message":"Tunnel not found"}""")
+                    }
+                }
+                path == "/api/keys" && method == "GET" -> {
+                    sendResponse(writer, 200, "application/json", pairedKeysToJson())
+                }
+                path == "/api/keys/pair" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val deviceName = params["deviceName"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val publicKey = params["publicKey"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val result = keyPairingManager.pairKey(deviceName = deviceName, publicKey = publicKey)
+                    if (result.isSuccess) {
+                        onUpdate?.invoke()
+                        val paired = result.getOrThrow()
+                        sendResponse(writer, 200, "application/json", """{"status":"ok","id":"${escapeJson(paired.id)}","fingerprint":"${escapeJson(paired.fingerprint)}"}""")
+                    } else {
+                        sendResponse(writer, 400, "application/json", """{"status":"error","message":"${escapeJson(result.exceptionOrNull()?.message ?: "Pairing failed")}"}""")
+                    }
+                }
+                path == "/api/keys/unpair" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val id = params["id"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    if (id.isNotBlank() && keyPairingManager.unpairKey(id)) {
+                        onUpdate?.invoke()
+                        sendResponse(writer, 200, "application/json", """{"status":"ok"}""")
+                    } else {
+                        sendResponse(writer, 404, "application/json", """{"status":"error","message":"Key not found"}""")
+                    }
+                }
                 path == "/style.css" -> {
                     sendResponse(writer, 200, "text/css", buildCss())
                 }
@@ -162,7 +217,7 @@ class LocalHttpServer(private val port: Int = 8080) {
     }
 
     private fun sendResponse(writer: PrintWriter, code: Int, contentType: String, body: String) {
-        val status = when (code) { 200 -> "OK"; 404 -> "Not Found"; else -> "OK" }
+        val status = when (code) { 200 -> "OK"; 400 -> "Bad Request"; 404 -> "Not Found"; else -> "OK" }
         val bytes = body.toByteArray(Charsets.UTF_8)
         writer.print("HTTP/1.1 $code $status\r\n")
         writer.print("Content-Type: $contentType; charset=UTF-8\r\n")
@@ -198,6 +253,32 @@ class LocalHttpServer(private val port: Int = 8080) {
         connectedClients.forEachIndexed { i, c ->
             if (i > 0) sb.append(",")
             sb.append("""{"ip":"${c.ip}","since":"${formatTime(c.connectedAt)}"}""")
+        }
+        sb.append("]")
+        return sb.toString()
+    }
+
+    private fun tunnelsToJson(): String {
+        val tunnels = tunnelManager.listTunnels()
+        val sb = StringBuilder("[")
+        tunnels.forEachIndexed { i, t ->
+            if (i > 0) sb.append(",")
+            sb.append(
+                """{"listenPort":${t.config.listenPort},"targetHost":"${escapeJson(t.config.targetHost)}","targetPort":${t.config.targetPort},"activeConnections":${t.activeConnections},"lastError":"${escapeJson(t.lastError)}"}"""
+            )
+        }
+        sb.append("]")
+        return sb.toString()
+    }
+
+    private fun pairedKeysToJson(): String {
+        val keys = keyPairingManager.listKeys()
+        val sb = StringBuilder("[")
+        keys.forEachIndexed { i, k ->
+            if (i > 0) sb.append(",")
+            sb.append(
+                """{"id":"${escapeJson(k.id)}","deviceName":"${escapeJson(k.deviceName)}","fingerprint":"${escapeJson(k.fingerprint)}","pairedAt":${k.pairedAt}}"""
+            )
         }
         sb.append("]")
         return sb.toString()
@@ -272,6 +353,28 @@ class LocalHttpServer(private val port: Int = 8080) {
     <div id="clients"></div>
   </div>
 </div>
+<div style="padding:12px 16px;border-top:1px solid #2a3040;background:#111522">
+  <h3 style="font-size:0.85rem;color:#90caf9;margin-bottom:8px">Offline SSH Tunnel</h3>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <input id="targetHost" placeholder="Target host/IP" style="background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0" />
+    <input id="targetPort" type="number" value="22" style="width:90px;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0" />
+    <input id="listenPort" type="number" value="2222" style="width:90px;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0" />
+    <button onclick="startTunnel()" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:8px 12px">Start Tunnel</button>
+    <button onclick="stopTunnel()" style="background:#b71c1c;color:#fff;border:none;border-radius:6px;padding:8px 12px">Stop Tunnel</button>
+  </div>
+  <div id="tunnelStatus" style="margin-top:8px;font-size:0.8rem;color:#a5d6a7"></div>
+</div>
+<div style="padding:12px 16px;border-top:1px solid #2a3040;background:#0d1320">
+  <h3 style="font-size:0.85rem;color:#ffcc80;margin-bottom:8px">Easy SSH Key Pairing</h3>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+    <input id="pairDeviceName" placeholder="Device name" style="background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0" />
+    <button onclick="pairKey()" style="background:#ef6c00;color:#fff;border:none;border-radius:6px;padding:8px 12px">Pair Public Key</button>
+  </div>
+  <textarea id="pairPublicKey" rows="3" placeholder="Paste SSH public key (ssh-ed25519 ...)
+" style="width:100%;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0"></textarea>
+  <div id="pairStatus" style="margin-top:8px;font-size:0.8rem;color:#ffe0b2"></div>
+  <div id="pairedKeys" style="margin-top:8px;font-size:0.8rem;color:#ffe0b2"></div>
+</div>
 <script>
 let lastMsgCount = 0;
 const myIp = location.hostname;
@@ -329,10 +432,109 @@ function esc(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+async function loadTunnels() {
+  try {
+    const r = await fetch('/api/tunnels');
+    const tunnels = await r.json();
+    if (!tunnels.length) {
+      document.getElementById('tunnelStatus').textContent = 'No active tunnel';
+      return;
+    }
+    const t = tunnels[0];
+    document.getElementById('tunnelStatus').textContent =
+      'Listening :' + t.listenPort + ' -> ' + t.targetHost + ':' + t.targetPort +
+      ' | active connections: ' + t.activeConnections + (t.lastError ? (' | last error: ' + t.lastError) : '');
+  } catch (e) {}
+}
+
+async function startTunnel() {
+  const targetHost = document.getElementById('targetHost').value.trim();
+  const targetPort = document.getElementById('targetPort').value.trim() || '22';
+  const listenPort = document.getElementById('listenPort').value.trim() || '2222';
+  if (!targetHost) return;
+  try {
+    await fetch('/api/tunnel/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'targetHost=' + encodeURIComponent(targetHost) + '&targetPort=' + encodeURIComponent(targetPort) + '&listenPort=' + encodeURIComponent(listenPort)
+    });
+    loadTunnels();
+  } catch (e) {}
+}
+
+async function stopTunnel() {
+  const listenPort = document.getElementById('listenPort').value.trim() || '2222';
+  try {
+    await fetch('/api/tunnel/stop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'listenPort=' + encodeURIComponent(listenPort)
+    });
+    loadTunnels();
+  } catch (e) {}
+}
+
+async function loadPairedKeys() {
+  try {
+    const r = await fetch('/api/keys');
+    const keys = await r.json();
+    const el = document.getElementById('pairedKeys');
+    if (!keys.length) {
+      el.textContent = 'No paired keys yet.';
+      return;
+    }
+    el.innerHTML = keys.map(k =>
+      '<div style="margin-top:6px;padding:6px;border:1px solid #2a3040;border-radius:6px">' +
+      '<b>' + esc(k.deviceName) + '</b><br/>' +
+      '<code>' + esc(k.fingerprint) + '</code> ' +
+      '<button onclick="unpairKey(\'' + k.id + '\')" style="margin-left:8px;background:#6d4c41;color:#fff;border:none;border-radius:4px;padding:2px 6px">Remove</button>' +
+      '</div>'
+    ).join('');
+  } catch (e) {}
+}
+
+async function pairKey() {
+  const deviceName = document.getElementById('pairDeviceName').value.trim() || 'Client Device';
+  const publicKey = document.getElementById('pairPublicKey').value.trim();
+  if (!publicKey) return;
+  const status = document.getElementById('pairStatus');
+  try {
+    const r = await fetch('/api/keys/pair', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'deviceName=' + encodeURIComponent(deviceName) + '&publicKey=' + encodeURIComponent(publicKey)
+    });
+    const data = await r.json();
+    if (data.status === 'ok') {
+      status.textContent = 'Paired. Fingerprint: ' + data.fingerprint + '. Use your private key with ssh -p ' +
+        (document.getElementById('listenPort').value.trim() || '2222') + ' <user>@' + location.hostname;
+      document.getElementById('pairPublicKey').value = '';
+      loadPairedKeys();
+    } else {
+      status.textContent = data.message || 'Pairing failed';
+    }
+  } catch (e) {}
+}
+
+async function unpairKey(id) {
+  try {
+    await fetch('/api/keys/unpair', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'id=' + encodeURIComponent(id)
+    });
+    loadPairedKeys();
+  } catch (e) {}
+}
+
 setInterval(loadMessages, 1500);
 setInterval(loadClients, 3000);
+setInterval(loadTunnels, 3000);
+setInterval(loadPairedKeys, 5000);
 loadMessages();
 loadClients();
+loadTunnels();
+loadPairedKeys();
 </script>
 </body>
 </html>
