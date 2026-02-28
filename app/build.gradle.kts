@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.ktlint)
 }
 
 android {
@@ -46,4 +47,8 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.recyclerview)
     implementation(libs.androidx.swiperefreshlayout)
+
+    // Unit tests — run on JVM, no Android emulator needed
+    testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
 }

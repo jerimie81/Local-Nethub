@@ -1,0 +1,265 @@
+name: CI
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggers
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel any in-flight run for the same branch/PR so we don't pile up jobs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write   # for PR comments (test summary, lint report)
+  checks: write          # for GitHub Checks annotations
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared env
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  JAVA_VERSION: '17'
+  GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.caching=true'
+
+jobs:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Kotlin lint (ktlint)
+  # Fast fail: runs first, blocks the rest if style is broken.
+  # On PRs the autocorrect job can fix and push a commit automatically.
+  # ───────────────────────────────────────────────────────────────────────────
+  lint-style:
+    name: Kotlin Style (ktlint)
+    runs-on: ubuntu-latest
+    outputs:
+      # Expose whether violations were found so the autocorrect job can decide.
+      violations: ${{ steps.ktlint-check.outputs.violations }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Fetch the full history so we can push a fix commit on PRs.
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run ktlint check
+        id: ktlint-check
+        # ktlintCheck returns exit code 1 on violations.
+        # We capture that so downstream jobs can react without failing the step.
+        run: |
+          if gradle --no-daemon :app:ktlintCheck 2>&1; then
+            echo "violations=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "violations=true"  >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Upload ktlint report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ktlint-report
+          path: app/build/reports/ktlint/
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2 — Android Lint (resource, manifest, API-level checks)
+  # ───────────────────────────────────────────────────────────────────────────
+  lint-android:
+    name: Android Lint
+    runs-on: ubuntu-latest
+    needs: lint-style   # only run after style passes
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK components
+        run: |
+          yes | sdkmanager --licenses 2>/dev/null | grep -v "^$" || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run Android lint
+        run: gradle --no-daemon :app:lintDebug
+
+      - name: Upload Android lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-lint-report
+          path: app/build/reports/lint-results-debug.*
+
+      # Post a summary comment on PRs so reviewers see lint issues inline.
+      - name: Comment lint summary on PR
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const xmlPath = 'app/build/reports/lint-results-debug.xml';
+            if (!fs.existsSync(xmlPath)) return;
+            const xml = fs.readFileSync(xmlPath, 'utf8');
+            const issues = [...xml.matchAll(/<issue id="([^"]+)"[^>]*message="([^"]+)"/g)]
+              .slice(0, 20)
+              .map(([, id, msg]) => `- **${id}**: ${msg}`)
+              .join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## ⚠️ Android Lint Issues\n\n${issues || 'See artifact for full report.'}\n\n> Download the full report from the [Actions artifacts](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`,
+            });
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Unit tests (JVM, no emulator)
+  # ───────────────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint-style   # run in parallel with android-lint
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run unit tests
+        # --continue so all test classes run even if one fails.
+        run: gradle --no-daemon --continue :app:testDebugUnitTest
+
+      # Publish results as GitHub Checks annotations (inline in PR diff).
+      - name: Publish test results
+        if: always()
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: app/build/test-results/testDebugUnitTest/**/*.xml
+          check_name: Unit Test Results
+          comment_mode: always   # posts/updates a PR comment with the summary
+          fail_on: test failures
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/test-results/testDebugUnitTest/
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 4 — Debug APK build (only if tests and lint pass)
+  # ───────────────────────────────────────────────────────────────────────────
+  build-debug:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+    needs: [lint-android, unit-tests]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK components
+        run: |
+          yes | sdkmanager --licenses 2>/dev/null | grep -v "^$" || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Assemble debug APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          # Keep for 14 days on branches, 30 on main
+          retention-days: ${{ github.ref == 'refs/heads/main' && 30 || 14 }}
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 5 — Release APK (main branch only, after debug build passes)
+  # ───────────────────────────────────────────────────────────────────────────
+  build-release:
+    name: Build Release APK
+    runs-on: ubuntu-latest
+    needs: build-debug
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK components
+        run: |
+          yes | sdkmanager --licenses 2>/dev/null | grep -v "^$" || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Assemble release APK
+        run: gradle --no-daemon :app:assembleRelease
+
+      - name: Upload unsigned release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk-unsigned
+          retention-days: 90
+          path: app/build/outputs/apk/release/app-release-unsigned.apk

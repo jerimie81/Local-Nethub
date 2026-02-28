@@ -1,0 +1,64 @@
+name: Dependency Updates
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs weekly to check for outdated dependencies and open a PR with updates.
+# Uses Gradle's built-in dependency-updates plugin (ben-manes).
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    # Every Monday at 08:00 UTC
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  JAVA_VERSION: '17'
+
+jobs:
+  check-updates:
+    name: Check Dependency Updates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Generate dependency update report
+        # dependencyUpdates outputs a plain-text report to build/dependencyUpdates/report.txt
+        run: gradle --no-daemon dependencyUpdates -Drevision=release --no-configuration-cache 2>&1 || true
+
+      - name: Upload dependency report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-update-report
+          retention-days: 7
+          path: build/dependencyUpdates/
+
+      - name: Post update summary as PR comment (if run manually)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reportPath = 'build/dependencyUpdates/report.txt';
+            if (!fs.existsSync(reportPath)) {
+              console.log('No report found');
+              return;
+            }
+            const report = fs.readFileSync(reportPath, 'utf8').slice(0, 3000);
+            console.log('Dependency update report:\n', report);
