@@ -10,8 +10,25 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
+  issues: write
 
 jobs:
+  coderabbit-review:
+    if: github.event_name == 'pull_request' && secrets.CODERABBIT_API_KEY != ''
+    name: CodeRabbit Review
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run CodeRabbit review
+        uses: coderabbitai/ai-pr-reviewer@latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CODERABBIT_API_KEY: ${{ secrets.CODERABBIT_API_KEY }}
+
   build:
     runs-on: ubuntu-latest
 
@@ -39,5 +56,15 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Build debug APK
-        run: gradle --no-daemon assembleDebug
+      - name: Build and lint debug APK
+        run: gradle --no-daemon --stacktrace assembleDebug lintDebug
+
+      - name: Upload diagnostics for fixing build errors
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-ci-diagnostics
+          path: |
+            **/build/reports/**
+            **/build/outputs/logs/**
+            **/build/test-results/**
