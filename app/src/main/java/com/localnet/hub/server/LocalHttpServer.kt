@@ -35,6 +35,7 @@ class LocalHttpServer(private val port: Int = 8080) {
     var onUpdate: (() -> Unit)? = null
     private val tunnelManager = SshTunnelManager()
     private val keyPairingManager = SshKeyPairingManager()
+    private val qrPairingManager = QrKeyPairingManager(keyPairingManager)
 
     var isRunning = false
         private set
@@ -89,7 +90,6 @@ class LocalHttpServer(private val port: Int = 8080) {
             val method = parts[0]
             val rawPath = parts[1]
             val path = rawPath.substringBefore("?")
-            val queryString = if (rawPath.contains("?")) rawPath.substringAfter("?") else ""
 
             // Read headers
             val headers = mutableMapOf<String, String>()
@@ -114,7 +114,7 @@ class LocalHttpServer(private val port: Int = 8080) {
                         if (bytesRead <= 0) break
                         read += bytesRead
                     }
-                    body = String(chars)
+                    body = String(chars, 0, read)
                 }
             }
 
@@ -199,6 +199,62 @@ class LocalHttpServer(private val port: Int = 8080) {
                         sendResponse(writer, 200, "application/json", """{"status":"ok"}""")
                     } else {
                         sendResponse(writer, 404, "application/json", """{"status":"error","message":"Key not found"}""")
+                    }
+                }
+                path == "/api/pairing/qr/init" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val deviceName = params["deviceName"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val publicKey = params["publicKey"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val result = qrPairingManager.createInitPayload(deviceName = deviceName, publicKey = publicKey)
+                    if (result.isSuccess) {
+                        val init = result.getOrThrow()
+                        sendResponse(
+                            writer,
+                            200,
+                            "application/json",
+                            """{"status":"ok","sessionId":"${escapeJson(init.sessionId)}","sas":"${escapeJson(init.sas)}","expiresAt":${init.expiresAt},"payload":"${escapeJson(init.payload)}"}"""
+                        )
+                    } else {
+                        sendResponse(writer, 400, "application/json", """{"status":"error","message":"${escapeJson(result.exceptionOrNull()?.message ?: "Init failed")}"}""")
+                    }
+                }
+                path == "/api/pairing/qr/respond" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val initPayload = params["initPayload"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val deviceName = params["deviceName"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val publicKey = params["publicKey"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val result = qrPairingManager.createResponsePayload(
+                        initPayload = initPayload,
+                        deviceName = deviceName,
+                        publicKey = publicKey
+                    )
+                    if (result.isSuccess) {
+                        val response = result.getOrThrow()
+                        sendResponse(
+                            writer,
+                            200,
+                            "application/json",
+                            """{"status":"ok","sessionId":"${escapeJson(response.sessionId)}","sas":"${escapeJson(response.sas)}","expiresAt":${response.expiresAt},"fingerprint":"${escapeJson(response.responderFingerprint)}","payload":"${escapeJson(response.payload)}"}"""
+                        )
+                    } else {
+                        sendResponse(writer, 400, "application/json", """{"status":"error","message":"${escapeJson(result.exceptionOrNull()?.message ?: "Response failed")}"}""")
+                    }
+                }
+                path == "/api/pairing/qr/finalize" && method == "POST" -> {
+                    val params = parseForm(body)
+                    val responsePayload = params["responsePayload"]?.let { URLDecoder.decode(it, "UTF-8") }.orEmpty()
+                    val result = qrPairingManager.finalizeFromResponse(responsePayload)
+                    if (result.isSuccess) {
+                        onUpdate?.invoke()
+                        val finalized = result.getOrThrow()
+                        sendResponse(
+                            writer,
+                            200,
+                            "application/json",
+                            """{"status":"ok","sessionId":"${escapeJson(finalized.sessionId)}","sas":"${escapeJson(finalized.sas)}","id":"${escapeJson(finalized.pairedKey.id)}","fingerprint":"${escapeJson(finalized.pairedKey.fingerprint)}"}"""
+                        )
+                    } else {
+                        sendResponse(writer, 400, "application/json", """{"status":"error","message":"${escapeJson(result.exceptionOrNull()?.message ?: "Finalize failed")}"}""")
                     }
                 }
                 path == "/style.css" -> {
@@ -365,14 +421,17 @@ class LocalHttpServer(private val port: Int = 8080) {
   <div id="tunnelStatus" style="margin-top:8px;font-size:0.8rem;color:#a5d6a7"></div>
 </div>
 <div style="padding:12px 16px;border-top:1px solid #2a3040;background:#0d1320">
-  <h3 style="font-size:0.85rem;color:#ffcc80;margin-bottom:8px">Easy SSH Key Pairing</h3>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
-    <input id="pairDeviceName" placeholder="Device name" style="background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0" />
-    <button onclick="pairKey()" style="background:#ef6c00;color:#fff;border:none;border-radius:6px;padding:8px 12px">Pair Public Key</button>
-  </div>
-  <textarea id="pairPublicKey" rows="3" placeholder="Paste SSH public key (ssh-ed25519 ...)
-" style="width:100%;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0"></textarea>
+  <h3 style="font-size:0.85rem;color:#ffcc80;margin-bottom:8px">Phase 1: QR SSH Key Pairing</h3>
+  <div style="font-size:0.78rem;color:#b0bec5;margin-bottom:8px">Step 1 on device A: Generate init payload and show as QR. Step 2 on device B: scan and respond. Step 3 on A: scan response and finalize. Verify SAS on both devices.</div>
+  <input id="pairDeviceName" placeholder="This device name" style="width:100%;margin-bottom:8px;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0" />
+  <textarea id="pairPublicKey" rows="3" placeholder="This device SSH public key (ssh-ed25519 ...)
+" style="width:100%;margin-bottom:8px;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0"></textarea>
+  <button onclick="createQrInit()" style="background:#ef6c00;color:#fff;border:none;border-radius:6px;padding:8px 12px">Create Init Payload</button>
   <div id="pairStatus" style="margin-top:8px;font-size:0.8rem;color:#ffe0b2"></div>
+  <textarea id="initPayload" rows="3" placeholder="Init payload (encode this as QR for device B)" style="width:100%;margin-top:8px;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0"></textarea>
+  <button onclick="createQrResponse()" style="margin-top:8px;background:#00897b;color:#fff;border:none;border-radius:6px;padding:8px 12px">Create Response From Init</button>
+  <textarea id="responsePayload" rows="3" placeholder="Response payload (encode this as QR back to device A)" style="width:100%;margin-top:8px;background:#1a1f2e;border:1px solid #2a3040;border-radius:6px;padding:8px;color:#e0e0e0"></textarea>
+  <button onclick="finalizeQrPairing()" style="margin-top:8px;background:#5e35b1;color:#fff;border:none;border-radius:6px;padding:8px 12px">Finalize From Response</button>
   <div id="pairedKeys" style="margin-top:8px;font-size:0.8rem;color:#ffe0b2"></div>
 </div>
 <script>
@@ -493,25 +552,75 @@ async function loadPairedKeys() {
   } catch (e) {}
 }
 
-async function pairKey() {
-  const deviceName = document.getElementById('pairDeviceName').value.trim() || 'Client Device';
+async function createQrInit() {
+  const deviceName = document.getElementById('pairDeviceName').value.trim() || 'Device A';
   const publicKey = document.getElementById('pairPublicKey').value.trim();
-  if (!publicKey) return;
   const status = document.getElementById('pairStatus');
+  if (!publicKey) {
+    status.textContent = 'Public key is required.';
+    return;
+  }
   try {
-    const r = await fetch('/api/keys/pair', {
+    const r = await fetch('/api/pairing/qr/init', {
       method: 'POST',
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
       body: 'deviceName=' + encodeURIComponent(deviceName) + '&publicKey=' + encodeURIComponent(publicKey)
     });
     const data = await r.json();
     if (data.status === 'ok') {
-      status.textContent = 'Paired. Fingerprint: ' + data.fingerprint + '. Use your private key with ssh -p ' +
-        (document.getElementById('listenPort').value.trim() || '2222') + ' <user>@' + location.hostname;
-      document.getElementById('pairPublicKey').value = '';
+      document.getElementById('initPayload').value = data.payload;
+      status.textContent = 'Init created. Verify SAS on both devices: ' + data.sas;
+    } else {
+      status.textContent = data.message || 'Init failed';
+    }
+  } catch (e) {}
+}
+
+async function createQrResponse() {
+  const initPayload = document.getElementById('initPayload').value.trim();
+  const deviceName = document.getElementById('pairDeviceName').value.trim() || 'Device B';
+  const publicKey = document.getElementById('pairPublicKey').value.trim();
+  const status = document.getElementById('pairStatus');
+  if (!initPayload || !publicKey) {
+    status.textContent = 'Init payload and public key are required.';
+    return;
+  }
+  try {
+    const r = await fetch('/api/pairing/qr/respond', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'initPayload=' + encodeURIComponent(initPayload) + '&deviceName=' + encodeURIComponent(deviceName) + '&publicKey=' + encodeURIComponent(publicKey)
+    });
+    const data = await r.json();
+    if (data.status === 'ok') {
+      document.getElementById('responsePayload').value = data.payload;
+      status.textContent = 'Response created. Verify SAS: ' + data.sas;
+    } else {
+      status.textContent = data.message || 'Response failed';
+    }
+  } catch (e) {}
+}
+
+async function finalizeQrPairing() {
+  const responsePayload = document.getElementById('responsePayload').value.trim();
+  const status = document.getElementById('pairStatus');
+  if (!responsePayload) {
+    status.textContent = 'Response payload is required.';
+    return;
+  }
+  try {
+    const r = await fetch('/api/pairing/qr/finalize', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'responsePayload=' + encodeURIComponent(responsePayload)
+    });
+    const data = await r.json();
+    if (data.status === 'ok') {
+      status.textContent = 'Pairing complete. Fingerprint: ' + data.fingerprint + '. SAS verified: ' + data.sas;
+      document.getElementById('responsePayload').value = '';
       loadPairedKeys();
     } else {
-      status.textContent = data.message || 'Pairing failed';
+      status.textContent = data.message || 'Finalize failed';
     }
   } catch (e) {}
 }
