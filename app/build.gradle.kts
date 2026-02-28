@@ -52,3 +52,12 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
 }
+
+// Pin ktlint engine to 1.4.1 — supports Kotlin 2.0 parsing.
+// ktlint-gradle 12.2.0 defaults to 1.4.x; we pin for reproducibility.
+configure<org.jlleitschuh.gradle.ktlint.KtlintExtension> {
+    version.set("1.4.1")
+    android.set(true)
+    outputToConsole.set(true)
+    outputColorName.set("RED")
+}
