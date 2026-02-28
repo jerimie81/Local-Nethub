@@ -1,4 +1,4 @@
-# Android Studio
+# Android Studio — IDE files (do not commit)
 .gradle/
 /build/
 /captures/
@@ -9,7 +9,8 @@
 *.hprof
 *.keystore
 *~
-# Misc
+
+# Outputs
 *.apk
 *.ap_
 *.aab
@@ -18,5 +19,12 @@
 /out/
 /release/
 /debug/
+
 # C/C++
 .cxx/
+
+# ktlint
+.editorconfig.bak
+
+# OS
+Thumbs.db

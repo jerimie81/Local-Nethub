@@ -1,0 +1,113 @@
+name: Autocorrect
+
+# ─────────────────────────────────────────────────────────────────────────────
+# This workflow runs on pull_request_target so it has write access to push
+# a fix commit back to the PR branch even from forks.
+#
+# Security note: We only run Gradle tasks — no user-supplied scripts — so
+# pull_request_target is safe here. Do NOT add steps that execute arbitrary
+# code from the PR branch under pull_request_target.
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+concurrency:
+  group: autocorrect-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write        # push the fix commit
+  pull-requests: write   # post the comment
+
+env:
+  JAVA_VERSION: '17'
+
+jobs:
+  ktlint-autocorrect:
+    name: ktlint Autocorrect
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          # Check out the actual PR head (not the merge commit).
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run ktlint format (autocorrect)
+        id: ktlint-format
+        run: |
+          gradle --no-daemon :app:ktlintFormat 2>&1
+          # Check if any files were modified by the formatter
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "✅ No style violations found — nothing to fix."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "🔧 ktlint found and fixed violations."
+          fi
+
+      - name: Commit and push fixes
+        if: steps.ktlint-format.outputs.changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "style: apply ktlint autocorrections [skip ci]"
+          git push
+
+      - name: Comment on PR — fixes applied
+        if: steps.ktlint-format.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '## 🔧 ktlint Autocorrect Applied',
+                '',
+                'This PR had Kotlin style violations. A fix commit has been pushed automatically.',
+                '',
+                '> **No action needed** — CI will re-run on the new commit.',
+                '> If you disagree with a rule, add an exemption to `.editorconfig`.',
+              ].join('\n'),
+            });
+
+      - name: Comment on PR — already clean
+        if: steps.ktlint-format.outputs.changed == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Only post if this is the first autocorrect run (avoid noise on reruns)
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const alreadyPosted = comments.data.some(c =>
+              c.body.includes('ktlint Autocorrect') && c.user.login === 'github-actions[bot]'
+            );
+            if (!alreadyPosted) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: '## ✅ ktlint Autocorrect\n\nNo style violations found. Code is clean!',
+              });
+            }
