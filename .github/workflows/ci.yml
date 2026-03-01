@@ -189,6 +189,9 @@ jobs:
     name: Build Debug APK
     runs-on: ubuntu-latest
     needs: [lint-android, unit-tests]
+    env:
+      # Use env indirection for conditional checks; avoids invalid `secrets.*` usage in `if` expressions.
+      CODERABBIT_API_KEY: ${{ secrets.CODERABBIT_API_KEY }}
 
     steps:
       - name: Checkout
@@ -222,6 +225,10 @@ jobs:
           # Keep for 14 days on branches, 30 on main
           retention-days: ${{ github.ref == 'refs/heads/main' && 30 || 14 }}
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: CodeRabbit key configured
+        if: github.event_name == 'pull_request' && env.CODERABBIT_API_KEY != ''
+        run: echo "CODERABBIT_API_KEY is available for pull request workflows."
 
   # ───────────────────────────────────────────────────────────────────────────
   # JOB 5 — Release APK (main branch only, after debug build passes)

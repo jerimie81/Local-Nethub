@@ -3,10 +3,12 @@ package com.localnet.hub.server
 import android.util.Log
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -16,60 +18,82 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Simple local TCP tunnel manager intended for SSH traffic forwarding between
- * devices connected to the same host/server network.
+ * Manages local TCP tunnels that forward traffic between two endpoints.
+ * Intended for SSH port-forwarding across devices on the same local network.
  */
 class SshTunnelManager {
 
     data class TunnelConfig(
         val listenPort: Int,
         val targetHost: String,
-        val targetPort: Int = 22
+        val targetPort: Int = 22,
     )
 
     data class TunnelRuntime(
         val config: TunnelConfig,
         val startedAt: Long = System.currentTimeMillis(),
-        @Volatile var activeConnections: Int = 0,
-        @Volatile var lastError: String = ""
-    )
+    ) {
+        // AtomicInteger avoids the lost-update race that @Volatile Int += 1 has.
+        internal val connectionCounter = AtomicInteger(0)
+
+        @Volatile
+        var lastError: String = ""
+
+        val activeConnections: Int get() = connectionCounter.get()
+    }
 
     private data class TunnelHandle(
         val runtime: TunnelRuntime,
         val serverSocket: ServerSocket,
         val scope: CoroutineScope,
-        val job: Job
+        val job: Job,
     )
 
-    private val tag = "SshTunnelManager"
+    private companion object {
+        const val TAG = "SshTunnelManager"
+        const val IO_BUFFER_SIZE = 8 * 1024
+    }
+
     private val tunnels = ConcurrentHashMap<Int, TunnelHandle>()
 
-    fun startTunnel(listenPort: Int, targetHost: String, targetPort: Int = 22): Result<TunnelRuntime> {
-        if (listenPort !in 1..65535) return Result.failure(IllegalArgumentException("Invalid listen port"))
-        if (targetPort !in 1..65535) return Result.failure(IllegalArgumentException("Invalid target port"))
-        if (targetHost.isBlank()) return Result.failure(IllegalArgumentException("Target host required"))
+    fun startTunnel(
+        listenPort: Int,
+        targetHost: String,
+        targetPort: Int = 22,
+    ): Result<TunnelRuntime> {
+        if (listenPort !in 1..65535) {
+            return Result.failure(IllegalArgumentException("Invalid listen port"))
+        }
+        if (targetPort !in 1..65535) {
+            return Result.failure(IllegalArgumentException("Invalid target port"))
+        }
+        if (targetHost.isBlank()) {
+            return Result.failure(IllegalArgumentException("Target host required"))
+        }
         if (tunnels.containsKey(listenPort)) {
             return Result.failure(IllegalStateException("Tunnel already running on port $listenPort"))
         }
 
-        val serverSocket = ServerSocket(listenPort)
+        // reuseAddress MUST be set before bind() — setting it after has no effect.
+        val serverSocket = ServerSocket()
         serverSocket.reuseAddress = true
+        serverSocket.bind(InetSocketAddress(listenPort))
 
         val runtime = TunnelRuntime(
-            config = TunnelConfig(listenPort = listenPort, targetHost = targetHost, targetPort = targetPort)
+            config = TunnelConfig(listenPort, targetHost, targetPort),
         )
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         val job = scope.launch {
-            Log.i(tag, "SSH tunnel listening on :$listenPort -> $targetHost:$targetPort")
+            Log.i(TAG, "Tunnel :$listenPort -> $targetHost:$targetPort started")
             while (isActive && !serverSocket.isClosed) {
                 try {
                     val incoming = serverSocket.accept()
-                    scope.launch { proxyConnection(runtime, incoming) }
+                    launch { proxyConnection(runtime, incoming) }
                 } catch (_: SocketException) {
                     break
                 } catch (e: Exception) {
-                    runtime.lastError = e.message ?: "Tunnel accept error"
-                    Log.e(tag, "Tunnel accept error on :$listenPort", e)
+                    runtime.lastError = e.message ?: "Accept error"
+                    Log.e(TAG, "Accept error on :$listenPort", e)
                 }
             }
         }
@@ -80,12 +104,10 @@ class SshTunnelManager {
 
     fun stopTunnel(listenPort: Int): Boolean {
         val handle = tunnels.remove(listenPort) ?: return false
-        try {
-            handle.job.cancel()
-            handle.serverSocket.close()
-            handle.scope.cancel()
-        } catch (_: Exception) {
-        }
+        runCatching { handle.job.cancel() }
+        runCatching { handle.serverSocket.close() }
+        runCatching { handle.scope.cancel() }
+        Log.i(TAG, "Tunnel :$listenPort stopped")
         return true
     }
 
@@ -99,41 +121,33 @@ class SshTunnelManager {
         var upstream: Socket? = null
         try {
             upstream = Socket(runtime.config.targetHost, runtime.config.targetPort)
-            runtime.activeConnections += 1
+            runtime.connectionCounter.incrementAndGet()
 
-            val c2s = Thread {
-                copy(incoming.getInputStream(), upstream.getOutputStream())
-            }
-            val s2c = Thread {
-                copy(upstream.getInputStream(), incoming.getOutputStream())
-            }
-
+            // Two plain threads relay bytes in each direction.
+            // join() on a thread is safe here — this whole function runs on an IO thread
+            // dispatched via scope.launch{ }, so blocking it doesn't starve the main thread.
+            val c2s = Thread { copy(incoming.getInputStream(), upstream.getOutputStream()) }
+            val s2c = Thread { copy(upstream.getInputStream(), incoming.getOutputStream()) }
             c2s.start()
             s2c.start()
             c2s.join()
             s2c.join()
         } catch (e: Exception) {
-            runtime.lastError = e.message ?: "Proxy connection error"
-            Log.e(tag, "Proxy connection error", e)
+            runtime.lastError = e.message ?: "Proxy error"
+            Log.e(TAG, "Proxy connection error", e)
         } finally {
-            runtime.activeConnections = (runtime.activeConnections - 1).coerceAtLeast(0)
-            try {
-                incoming.close()
-            } catch (_: Exception) {
-            }
-            try {
-                upstream?.close()
-            } catch (_: Exception) {
-            }
+            runtime.connectionCounter.decrementAndGet()
+            runCatching { incoming.close() }
+            runCatching { upstream?.close() }
         }
     }
 
     private fun copy(input: InputStream, output: OutputStream) {
-        val buffer = ByteArray(8 * 1024)
+        val buf = ByteArray(IO_BUFFER_SIZE)
         while (true) {
-            val read = input.read(buffer)
-            if (read <= 0) break
-            output.write(buffer, 0, read)
+            val n = input.read(buf)
+            if (n <= 0) break
+            output.write(buf, 0, n)
             output.flush()
         }
     }

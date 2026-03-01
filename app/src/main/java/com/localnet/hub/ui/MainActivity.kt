@@ -12,10 +12,12 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ListView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
@@ -23,6 +25,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import com.google.android.material.snackbar.Snackbar
+import com.google.android.material.switchmaterial.SwitchMaterial
 import com.google.android.material.tabs.TabLayout
 import com.localnet.hub.R
 import com.localnet.hub.wifi.WifiDirectManager
@@ -34,10 +37,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var wifiDirect: WifiDirectManager
     private lateinit var messageAdapter: MessageAdapter
 
-    // Views
+    // Tab content views
     private lateinit var tabLayout: TabLayout
     private lateinit var contentServer: View
     private lateinit var contentP2p: View
+    private lateinit var contentSettings: View
 
     // Server tab views
     private lateinit var tvServerStatus: TextView
@@ -57,6 +61,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnDiscover: Button
     private lateinit var lvPeers: ListView
 
+    // Settings tab views
+    private lateinit var switchAutoStart: SwitchMaterial
+    private lateinit var switchMobileFallback: SwitchMaterial
+    private lateinit var switchDarkMode: SwitchMaterial
+    private lateinit var etDeviceAlias: EditText
+    private lateinit var switchRequirePin: SwitchMaterial
+    private lateinit var switchSshOnly: SwitchMaterial
+    private lateinit var spinnerVisibility: Spinner
+    private lateinit var switchNotifyDevice: SwitchMaterial
+    private lateinit var switchNotifyErrors: SwitchMaterial
+    private lateinit var switchEnableLogging: SwitchMaterial
+    private lateinit var spinnerLogLevel: Spinner
+    private lateinit var spinnerLogDestination: Spinner
+    private lateinit var btnApplySettings: Button
+
+    private val settingsPrefs by lazy { getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
+
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
@@ -68,6 +89,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        applySavedThemeMode()
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
@@ -86,6 +108,7 @@ class MainActivity : AppCompatActivity() {
         tabLayout = findViewById(R.id.tabLayout)
         contentServer = findViewById(R.id.contentServer)
         contentP2p = findViewById(R.id.contentP2p)
+        contentSettings = findViewById(R.id.contentSettings)
 
         tvServerStatus = findViewById(R.id.tvServerStatus)
         tvServerUrl = findViewById(R.id.tvServerUrl)
@@ -102,15 +125,31 @@ class MainActivity : AppCompatActivity() {
         btnRemoveGroup = findViewById(R.id.btnRemoveGroup)
         btnDiscover = findViewById(R.id.btnDiscover)
         lvPeers = findViewById(R.id.lvPeers)
+
+        switchAutoStart = findViewById(R.id.switchAutoStart)
+        switchMobileFallback = findViewById(R.id.switchMobileFallback)
+        switchDarkMode = findViewById(R.id.switchDarkMode)
+        etDeviceAlias = findViewById(R.id.etDeviceAlias)
+        switchRequirePin = findViewById(R.id.switchRequirePin)
+        switchSshOnly = findViewById(R.id.switchSshOnly)
+        spinnerVisibility = findViewById(R.id.spinnerVisibility)
+        switchNotifyDevice = findViewById(R.id.switchNotifyDevice)
+        switchNotifyErrors = findViewById(R.id.switchNotifyErrors)
+        switchEnableLogging = findViewById(R.id.switchEnableLogging)
+        spinnerLogLevel = findViewById(R.id.spinnerLogLevel)
+        spinnerLogDestination = findViewById(R.id.spinnerLogDestination)
+        btnApplySettings = findViewById(R.id.btnApplySettings)
     }
 
     private fun setupTabs() {
-        tabLayout.addTab(tabLayout.newTab().setText("Server"))
-        tabLayout.addTab(tabLayout.newTab().setText("Wi-Fi Direct"))
+        tabLayout.addTab(tabLayout.newTab().setText(getString(R.string.tab_server)))
+        tabLayout.addTab(tabLayout.newTab().setText(getString(R.string.tab_wifi_direct)))
+        tabLayout.addTab(tabLayout.newTab().setText(getString(R.string.tab_settings)))
         tabLayout.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
             override fun onTabSelected(tab: TabLayout.Tab) {
                 contentServer.visibility = if (tab.position == 0) View.VISIBLE else View.GONE
                 contentP2p.visibility = if (tab.position == 1) View.VISIBLE else View.GONE
+                contentSettings.visibility = if (tab.position == 2) View.VISIBLE else View.GONE
             }
             override fun onTabUnselected(tab: TabLayout.Tab) {}
             override fun onTabReselected(tab: TabLayout.Tab) {}
@@ -124,6 +163,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupListeners() {
+        setupSettingsControls()
+
         btnSend.setOnClickListener {
             val text = etMessage.text.toString().trim()
             if (text.isNotEmpty()) {
@@ -142,19 +183,19 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnCreateGroup.setOnClickListener {
-            wifiDirect.createGroup { success, msg ->
+            wifiDirect.createGroup { _, msg ->
                 runOnUiThread { viewModel.showSnack(msg) }
             }
         }
 
         btnRemoveGroup.setOnClickListener {
-            wifiDirect.removeGroup { success, msg ->
+            wifiDirect.removeGroup { _, msg ->
                 runOnUiThread { viewModel.showSnack(msg) }
             }
         }
 
         btnDiscover.setOnClickListener {
-            wifiDirect.discoverPeers { success, msg ->
+            wifiDirect.discoverPeers { _, msg ->
                 runOnUiThread { viewModel.showSnack(msg) }
             }
         }
@@ -163,11 +204,102 @@ class MainActivity : AppCompatActivity() {
             val p2p = viewModel.uiState.value.p2pState
             if (position < p2p.peers.size) {
                 val device = p2p.peers[position]
-                wifiDirect.connectToPeer(device) { success, msg ->
+                wifiDirect.connectToPeer(device) { _, msg ->
                     runOnUiThread { viewModel.showSnack(msg) }
                 }
             }
         }
+    }
+
+    private fun setupSettingsControls() {
+        spinnerVisibility.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            listOf(
+                getString(R.string.visibility_private),
+                getString(R.string.visibility_team),
+                getString(R.string.visibility_public),
+            ),
+        )
+
+        spinnerLogLevel.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            listOf(
+                getString(R.string.log_level_error),
+                getString(R.string.log_level_warn),
+                getString(R.string.log_level_info),
+                getString(R.string.log_level_debug),
+            ),
+        )
+
+        spinnerLogDestination.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            listOf(
+                getString(R.string.log_destination_app),
+                getString(R.string.log_destination_downloads),
+                getString(R.string.log_destination_shared),
+            ),
+        )
+
+        // Restore persisted values
+        switchAutoStart.isChecked = settingsPrefs.getBoolean(KEY_AUTO_START, true)
+        switchMobileFallback.isChecked = settingsPrefs.getBoolean(KEY_MOBILE_FALLBACK, false)
+        switchDarkMode.isChecked = settingsPrefs.getBoolean(KEY_DARK_MODE, false)
+        etDeviceAlias.setText(settingsPrefs.getString(KEY_DEVICE_ALIAS, ""))
+        switchRequirePin.isChecked = settingsPrefs.getBoolean(KEY_REQUIRE_PIN, false)
+        switchSshOnly.isChecked = settingsPrefs.getBoolean(KEY_SSH_ONLY, false)
+        spinnerVisibility.setSelection(settingsPrefs.getInt(KEY_VISIBILITY_INDEX, 1).coerceIn(0, 2))
+        switchNotifyDevice.isChecked = settingsPrefs.getBoolean(KEY_NOTIFY_DEVICE, true)
+        switchNotifyErrors.isChecked = settingsPrefs.getBoolean(KEY_NOTIFY_ERRORS, true)
+        switchEnableLogging.isChecked = settingsPrefs.getBoolean(KEY_ENABLE_LOGGING, true)
+        spinnerLogLevel.setSelection(settingsPrefs.getInt(KEY_LOG_LEVEL_INDEX, 2).coerceIn(0, 3))
+        spinnerLogDestination.setSelection(settingsPrefs.getInt(KEY_LOG_DEST_INDEX, 0).coerceIn(0, 2))
+
+        btnApplySettings.setOnClickListener {
+            val alias = etDeviceAlias.text.toString().trim().ifEmpty { "Current device" }
+            val selectedDarkMode = switchDarkMode.isChecked
+
+            settingsPrefs.edit()
+                .putBoolean(KEY_AUTO_START, switchAutoStart.isChecked)
+                .putBoolean(KEY_MOBILE_FALLBACK, switchMobileFallback.isChecked)
+                .putBoolean(KEY_DARK_MODE, selectedDarkMode)
+                .putString(KEY_DEVICE_ALIAS, etDeviceAlias.text.toString().trim())
+                .putBoolean(KEY_REQUIRE_PIN, switchRequirePin.isChecked)
+                .putBoolean(KEY_SSH_ONLY, switchSshOnly.isChecked)
+                .putInt(KEY_VISIBILITY_INDEX, spinnerVisibility.selectedItemPosition)
+                .putBoolean(KEY_NOTIFY_DEVICE, switchNotifyDevice.isChecked)
+                .putBoolean(KEY_NOTIFY_ERRORS, switchNotifyErrors.isChecked)
+                .putBoolean(KEY_ENABLE_LOGGING, switchEnableLogging.isChecked)
+                .putInt(KEY_LOG_LEVEL_INDEX, spinnerLogLevel.selectedItemPosition)
+                .putInt(KEY_LOG_DEST_INDEX, spinnerLogDestination.selectedItemPosition)
+                .apply()
+
+            val newMode = if (selectedDarkMode) AppCompatDelegate.MODE_NIGHT_YES
+                          else AppCompatDelegate.MODE_NIGHT_NO
+            if (AppCompatDelegate.getDefaultNightMode() != newMode) {
+                AppCompatDelegate.setDefaultNightMode(newMode)
+            }
+
+            val summary = buildString {
+                append("Settings saved for ")
+                append(alias)
+                append(" • ")
+                append(spinnerVisibility.selectedItem.toString())
+                append(" • ")
+                append(spinnerLogLevel.selectedItem.toString())
+            }
+            Snackbar.make(btnApplySettings, summary, Snackbar.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun applySavedThemeMode() {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        AppCompatDelegate.setDefaultNightMode(
+            if (prefs.getBoolean(KEY_DARK_MODE, false)) AppCompatDelegate.MODE_NIGHT_YES
+            else AppCompatDelegate.MODE_NIGHT_NO,
+        )
     }
 
     private fun observeState() {
@@ -176,7 +308,7 @@ class MainActivity : AppCompatActivity() {
                 // Server tab
                 tvServerStatus.text = if (state.serverRunning) "● Server Running" else "○ Server Stopped"
                 tvServerStatus.setTextColor(
-                    if (state.serverRunning) 0xFF4CAF50.toInt() else 0xFFf44336.toInt()
+                    if (state.serverRunning) 0xFF4CAF50.toInt() else 0xFFf44336.toInt(),
                 )
                 tvIpAddress.text = "IP: ${state.localIp}"
                 tvServerUrl.text = state.serverUrl.ifEmpty { "Server not reachable" }
@@ -201,19 +333,20 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 val peerNames = p2p.peers.map { "${it.deviceName ?: it.deviceAddress} (tap to connect)" }
-                lvPeers.adapter = ArrayAdapter(this@MainActivity,
-                    android.R.layout.simple_list_item_1, peerNames)
+                lvPeers.adapter = ArrayAdapter(
+                    this@MainActivity,
+                    android.R.layout.simple_list_item_1,
+                    peerNames,
+                )
 
                 if (state.snackMessage.isNotEmpty()) {
                     Snackbar.make(tabLayout, state.snackMessage, Snackbar.LENGTH_SHORT).show()
                     viewModel.clearSnack()
                 }
-
-                // Update P2P state from manager
-                viewModel.updateP2pState(wifiDirect.state.value)
             }
         }
 
+        // Single collector for P2P state — eliminates the double-update from the old code.
         lifecycleScope.launch {
             wifiDirect.state.collect { p2pState ->
                 viewModel.updateP2pState(p2pState)
@@ -225,7 +358,7 @@ class MainActivity : AppCompatActivity() {
         val needed = mutableListOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_WIFI_STATE,
-            Manifest.permission.CHANGE_WIFI_STATE
+            Manifest.permission.CHANGE_WIFI_STATE,
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             needed.add(Manifest.permission.NEARBY_WIFI_DEVICES)
@@ -245,5 +378,21 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         wifiDirect.unregisterReceiver()
+    }
+
+    companion object {
+        private const val PREFS_NAME = "localnet_hub_settings"
+        private const val KEY_AUTO_START = "auto_start"
+        private const val KEY_MOBILE_FALLBACK = "mobile_fallback"
+        private const val KEY_DARK_MODE = "dark_mode"
+        private const val KEY_DEVICE_ALIAS = "device_alias"
+        private const val KEY_REQUIRE_PIN = "require_pin"
+        private const val KEY_SSH_ONLY = "ssh_only"
+        private const val KEY_VISIBILITY_INDEX = "visibility_index"
+        private const val KEY_NOTIFY_DEVICE = "notify_device"
+        private const val KEY_NOTIFY_ERRORS = "notify_errors"
+        private const val KEY_ENABLE_LOGGING = "enable_logging"
+        private const val KEY_LOG_LEVEL_INDEX = "log_level_index"
+        private const val KEY_LOG_DEST_INDEX = "log_dest_index"
     }
 }

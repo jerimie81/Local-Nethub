@@ -49,8 +49,6 @@ dependencies {
     implementation(libs.androidx.swiperefreshlayout)
 
     // Unit tests — run on JVM, no Android emulator needed
-    testImplementation(libs.junit)
-    testImplementation(libs.kotlinx.coroutines.test)
 }
 
 // Pin ktlint engine to 1.4.1 — supports Kotlin 2.0 parsing.

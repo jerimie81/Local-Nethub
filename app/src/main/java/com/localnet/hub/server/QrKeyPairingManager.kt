@@ -10,7 +10,7 @@ data class QrPairingInit(
     val payload: String,
     val sessionId: String,
     val sas: String,
-    val expiresAt: Long
+    val expiresAt: Long,
 )
 
 data class QrPairingResponse(
@@ -18,45 +18,40 @@ data class QrPairingResponse(
     val sessionId: String,
     val sas: String,
     val responderFingerprint: String,
-    val expiresAt: Long
+    val expiresAt: Long,
 )
 
 data class QrPairingFinalize(
     val pairedKey: PairedSshKey,
     val sessionId: String,
-    val sas: String
+    val sas: String,
 )
 
 class QrKeyPairingManager(
     private val keyPairingManager: SshKeyPairingManager,
-    private val sessionTtlMs: Long = 120_000
+    private val sessionTtlMs: Long = 120_000,
 ) {
 
     private data class PendingSession(
         val sessionId: String,
         val nonce: String,
         val sas: String,
-        val expiresAt: Long
+        val expiresAt: Long,
     )
 
     private val sessions = ConcurrentHashMap<String, PendingSession>()
 
     fun createInitPayload(deviceName: String, publicKey: String): Result<QrPairingInit> {
-        val pairResult = keyPairingManager.validate(deviceName = deviceName, publicKey = publicKey)
+        val v = keyPairingManager.validate(deviceName, publicKey)
             .getOrElse { return Result.failure(it) }
 
         pruneExpired()
         val sessionId = UUID.randomUUID().toString().replace("-", "")
         val nonce = UUID.randomUUID().toString().replace("-", "")
         val expiresAt = System.currentTimeMillis() + sessionTtlMs
-        val sas = shortCode("$sessionId|$nonce|${pairResult.fingerprint}|$expiresAt")
+        val sas = shortCode("$sessionId|$nonce|${v.fingerprint}|$expiresAt")
 
-        sessions[sessionId] = PendingSession(
-            sessionId = sessionId,
-            nonce = nonce,
-            sas = sas,
-            expiresAt = expiresAt
-        )
+        sessions[sessionId] = PendingSession(sessionId, nonce, sas, expiresAt)
 
         val payload = encodePayload(
             type = "init",
@@ -65,19 +60,25 @@ class QrKeyPairingManager(
                 "nonce" to nonce,
                 "exp" to expiresAt.toString(),
                 "sas" to sas,
-                "name" to pairResult.deviceName,
-                "key" to pairResult.publicKey
-            )
+                "name" to v.deviceName,
+                "key" to v.publicKey,
+            ),
         )
 
         return Result.success(QrPairingInit(payload, sessionId, sas, expiresAt))
     }
 
-    fun createResponsePayload(initPayload: String, deviceName: String, publicKey: String): Result<QrPairingResponse> {
+    fun createResponsePayload(
+        initPayload: String,
+        deviceName: String,
+        publicKey: String,
+    ): Result<QrPairingResponse> {
         val initData = decodePayload(initPayload).getOrElse { return Result.failure(it) }
-        if (initData["type"] != "init") return Result.failure(IllegalArgumentException("Invalid init payload type"))
+        if (initData["type"] != "init") {
+            return Result.failure(IllegalArgumentException("Invalid init payload type"))
+        }
 
-        val pairResult = keyPairingManager.validate(deviceName = deviceName, publicKey = publicKey)
+        val v = keyPairingManager.validate(deviceName, publicKey)
             .getOrElse { return Result.failure(it) }
 
         val sessionId = initData["sid"].orEmpty()
@@ -85,22 +86,22 @@ class QrKeyPairingManager(
         val expiresAt = initData["exp"]?.toLongOrNull()
             ?: return Result.failure(IllegalArgumentException("Missing expiration"))
         val sas = initData["sas"].orEmpty()
-        val initiatorFingerprint = initData["key"]?.let { keyPairingManager.fingerprintFor(it) }
-            ?: return Result.failure(IllegalArgumentException("Missing initiator key"))
+        val initiatorKey = initData["key"].orEmpty()
 
-        if (sessionId.isBlank() || nonce.isBlank() || sas.isBlank()) {
+        if (sessionId.isBlank() || nonce.isBlank() || sas.isBlank() || initiatorKey.isBlank()) {
             return Result.failure(IllegalArgumentException("Malformed init payload"))
         }
         if (System.currentTimeMillis() > expiresAt) {
             return Result.failure(IllegalStateException("Pairing request expired"))
         }
 
+        val initiatorFingerprint = keyPairingManager.fingerprintFor(initiatorKey)
         val expectedSas = shortCode("$sessionId|$nonce|$initiatorFingerprint|$expiresAt")
         if (sas != expectedSas) {
             return Result.failure(IllegalArgumentException("SAS mismatch"))
         }
 
-        val proof = hash("$sessionId|$nonce|${pairResult.fingerprint}|$sas")
+        val proof = hash("$sessionId|$nonce|${v.fingerprint}|$sas")
         val payload = encodePayload(
             type = "resp",
             values = mapOf(
@@ -108,10 +109,10 @@ class QrKeyPairingManager(
                 "nonce" to nonce,
                 "exp" to expiresAt.toString(),
                 "sas" to sas,
-                "name" to pairResult.deviceName,
-                "key" to pairResult.publicKey,
-                "proof" to proof
-            )
+                "name" to v.deviceName,
+                "key" to v.publicKey,
+                "proof" to proof,
+            ),
         )
 
         return Result.success(
@@ -119,25 +120,27 @@ class QrKeyPairingManager(
                 payload = payload,
                 sessionId = sessionId,
                 sas = sas,
-                responderFingerprint = pairResult.fingerprint,
-                expiresAt = expiresAt
-            )
+                responderFingerprint = v.fingerprint,
+                expiresAt = expiresAt,
+            ),
         )
     }
 
     fun finalizeFromResponse(responsePayload: String): Result<QrPairingFinalize> {
         pruneExpired()
-        val response = decodePayload(responsePayload).getOrElse { return Result.failure(it) }
-        if (response["type"] != "resp") return Result.failure(IllegalArgumentException("Invalid response payload type"))
+        val resp = decodePayload(responsePayload).getOrElse { return Result.failure(it) }
+        if (resp["type"] != "resp") {
+            return Result.failure(IllegalArgumentException("Invalid response payload type"))
+        }
 
-        val sessionId = response["sid"].orEmpty()
-        val nonce = response["nonce"].orEmpty()
-        val expiresAt = response["exp"]?.toLongOrNull()
+        val sessionId = resp["sid"].orEmpty()
+        val nonce = resp["nonce"].orEmpty()
+        val expiresAt = resp["exp"]?.toLongOrNull()
             ?: return Result.failure(IllegalArgumentException("Missing expiration"))
-        val sas = response["sas"].orEmpty()
-        val responderName = response["name"].orEmpty()
-        val responderKey = response["key"].orEmpty()
-        val proof = response["proof"].orEmpty()
+        val sas = resp["sas"].orEmpty()
+        val responderName = resp["name"].orEmpty()
+        val responderKey = resp["key"].orEmpty()
+        val proof = resp["proof"].orEmpty()
 
         val pending = sessions[sessionId]
             ?: return Result.failure(IllegalStateException("Unknown or expired pairing session"))
@@ -151,12 +154,12 @@ class QrKeyPairingManager(
         }
 
         val responderFingerprint = keyPairingManager.fingerprintFor(responderKey)
-        val expectedProof = hash("$sessionId|$nonce|$responderFingerprint|$sas")
-        if (proof != expectedProof) {
+        if (proof != hash("$sessionId|$nonce|$responderFingerprint|$sas")) {
             return Result.failure(IllegalArgumentException("Response proof mismatch"))
         }
 
-        val paired = keyPairingManager.pairKey(responderName, responderKey).getOrElse { return Result.failure(it) }
+        val paired = keyPairingManager.pairKey(responderName, responderKey)
+            .getOrElse { return Result.failure(it) }
         sessions.remove(sessionId)
         return Result.success(QrPairingFinalize(paired, sessionId, sas))
     }
@@ -172,26 +175,25 @@ class QrKeyPairingManager(
     }
 
     private fun decodePayload(payload: String): Result<Map<String, String>> {
-        if (!payload.startsWith("lnh1|")) return Result.failure(IllegalArgumentException("Invalid payload prefix"))
-        val parts = payload.split("|")
+        if (!payload.startsWith("lnh1|")) {
+            return Result.failure(IllegalArgumentException("Invalid payload prefix"))
+        }
         val map = mutableMapOf<String, String>()
-        for (part in parts.drop(1)) {
+        for (part in payload.split("|").drop(1)) {
             val idx = part.indexOf('=')
             if (idx <= 0) continue
-            val k = part.substring(0, idx)
-            val v = part.substring(idx + 1)
-            map[k] = dec(v)
+            map[part.substring(0, idx)] = dec(part.substring(idx + 1))
         }
         return Result.success(map)
     }
 
-    private fun hash(value: String): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
-        return digest.joinToString("") { "%02x".format(it) }
-    }
+    private fun hash(value: String): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(value.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
 
     private fun shortCode(seed: String): String = hash(seed).take(6).uppercase()
 
-    private fun enc(value: String) = URLEncoder.encode(value, "UTF-8")
-    private fun dec(value: String) = URLDecoder.decode(value, "UTF-8")
+    private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8")
+    private fun dec(value: String): String = URLDecoder.decode(value, "UTF-8")
 }

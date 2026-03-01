@@ -15,11 +15,14 @@ import com.localnet.hub.ui.MainActivity
 
 class NetworkService : Service() {
 
-    private val TAG = "NetworkService"
-    private val CHANNEL_ID = "LocalNetHub"
-    private val NOTIF_ID = 1
+    companion object {
+        private const val TAG = "NetworkService"
+        private const val CHANNEL_ID = "LocalNetHub"
+        private const val NOTIF_ID = 1
+        const val SERVER_PORT = 8080
+    }
 
-    val httpServer = LocalHttpServer(port = 8080)
+    val httpServer = LocalHttpServer(port = SERVER_PORT)
     private val binder = LocalBinder()
 
     inner class LocalBinder : Binder() {
@@ -29,21 +32,20 @@ class NetworkService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification("Server starting..."))
+        startForeground(NOTIF_ID, buildNotification("Server starting…"))
         httpServer.onUpdate = { updateNotification() }
         httpServer.start()
-        Log.i(TAG, "NetworkService created, HTTP server running on :8080")
+        Log.i(TAG, "NetworkService created — HTTP server on :$SERVER_PORT")
     }
 
     override fun onBind(intent: Intent): IBinder = binder
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
         httpServer.stop()
         super.onDestroy()
     }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int =
-        START_STICKY
 
     private fun updateNotification() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
@@ -53,16 +55,16 @@ class NetworkService : Service() {
     }
 
     private fun buildNotification(text: String): Notification {
-        val pendingIntent = PendingIntent.getActivity(
+        val pi = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.FLAG_IMMUTABLE,
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("LocalNet Hub Active")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_share)
-            .setContentIntent(pendingIntent)
+            .setContentIntent(pi)
             .setOngoing(true)
             .build()
     }
@@ -71,11 +73,9 @@ class NetworkService : Service() {
         val channel = NotificationChannel(
             CHANNEL_ID,
             "LocalNet Hub",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Local network server status"
-        }
-        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        nm.createNotificationChannel(channel)
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply { description = "Local network server status" }
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+            .createNotificationChannel(channel)
     }
 }
