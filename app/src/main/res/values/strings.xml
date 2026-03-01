@@ -1,4 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">LocalNet Hub</string>
+    <string name="tab_server">Server</string>
+    <string name="tab_wifi_direct">Wi-Fi Direct</string>
+    <string name="tab_settings">Settings</string>
+    <string name="settings_title">Workspace Settings</string>
+    <string name="settings_subtitle">Tune security, sharing, and notifications for a reliable local-network experience.</string>
+    <string name="settings_connectivity">Connectivity</string>
+    <string name="settings_auto_start_server">Auto-start server when app launches</string>
+    <string name="settings_allow_mobile_data">Allow mobile data fallback</string>
+    <string name="settings_dark_mode">Enable dark mode</string>
+    <string name="settings_logging">Logging</string>
+    <string name="settings_enable_logging">Enable diagnostics logging</string>
+    <string name="settings_log_level">Log level</string>
+    <string name="settings_log_destination">Save logs to</string>
+    <string name="log_level_error">Error</string>
+    <string name="log_level_warn">Warn</string>
+    <string name="log_level_info">Info</string>
+    <string name="log_level_debug">Debug</string>
+    <string name="log_destination_app">App private storage</string>
+    <string name="log_destination_downloads">Downloads folder</string>
+    <string name="log_destination_shared">Shared local exports</string>
+    <string name="settings_device_alias">Device alias</string>
+    <string name="settings_security">Security</string>
+    <string name="settings_pin_access">Require PIN for remote access</string>
+    <string name="settings_ssh_only">Enable SSH-only pairing mode</string>
+    <string name="settings_network_visibility">Network visibility</string>
+    <string name="visibility_private">Private (trusted devices only)</string>
+    <string name="visibility_team">Team (same Wi-Fi network)</string>
+    <string name="visibility_public">Public (discoverable)</string>
+    <string name="settings_notifications">Notifications</string>
+    <string name="settings_notify_device">Device connect/disconnect alerts</string>
+    <string name="settings_notify_errors">Critical errors and recovery tips</string>
+    <string name="settings_apply">Apply settings</string>
 </resources>
