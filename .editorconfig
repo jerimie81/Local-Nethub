@@ -18,3 +18,8 @@ ktlint_standard_trailing-comma-on-call-site = disabled
 ktlint_standard_trailing-comma-on-declaration-site = disabled
 # Allow multiline strings to not follow indent rules (embedded HTML/CSS)
 ktlint_standard_multiline-expression-wrapping = disabled
+
+# Test files: SSH key strings and long assertion messages legitimately exceed 120 chars.
+# Disable max-line-length for test sources only.
+[app/src/test/**/*.kt]
+max_line_length = off

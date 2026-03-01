@@ -7,7 +7,8 @@ import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 import com.localnet.hub.server.ChatMessage
 import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Date
+import java.util.Locale
 
 class MessageAdapter(private val messages: MutableList<ChatMessage> = mutableListOf()) :
     RecyclerView.Adapter<MessageAdapter.VH>() {

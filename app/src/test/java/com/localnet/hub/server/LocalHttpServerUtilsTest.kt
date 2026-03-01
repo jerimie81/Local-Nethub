@@ -1,10 +1,10 @@
 package com.localnet.hub.server
 
+import java.lang.reflect.Method
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
-import java.lang.reflect.Method
 
 /**
  * Tests for LocalHttpServer utility methods via reflection.

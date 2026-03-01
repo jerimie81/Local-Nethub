@@ -13,12 +13,12 @@ import com.localnet.hub.server.ConnectedClient
 import com.localnet.hub.server.NetworkService
 import com.localnet.hub.wifi.P2pState
 import com.localnet.hub.wifi.WifiDirectManager
+import java.net.NetworkInterface
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.net.NetworkInterface
 
 data class UiState(
     val localIp: String = "Detecting...",
