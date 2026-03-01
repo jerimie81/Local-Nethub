@@ -14,6 +14,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # Use env indirection for conditional checks; avoids invalid `secrets.*` usage in `if` expressions.
+      CODERABBIT_API_KEY: ${{ secrets.CODERABBIT_API_KEY }}
 
     steps:
       - name: Checkout
@@ -41,3 +44,13 @@ jobs:
 
       - name: Build debug APK
         run: gradle --no-daemon assembleDebug
+
+      - name: Run unit tests
+        run: gradle --no-daemon test
+
+      - name: Run lint
+        run: gradle --no-daemon lint
+
+      - name: CodeRabbit key configured
+        if: github.event_name == 'pull_request' && env.CODERABBIT_API_KEY != ''
+        run: echo "CODERABBIT_API_KEY is available for pull request workflows."
